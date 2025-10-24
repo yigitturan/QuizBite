@@ -81,7 +81,8 @@ async function callGemini({ systemPrompt, userPrompt, model }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY missing");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
+
 
   const payload = {
     systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
