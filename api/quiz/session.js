@@ -41,11 +41,10 @@ Constraints:
       count
     });
 
-    // 🔒 Provider'ı sabitliyoruz ki yanlışlıkla OpenAI path'ine düşmesin
+    // 🔒 Sadece Gemini
     const provider = "gemini";
     console.log("[/api/quiz/session] provider:", provider);
 
-    // ---- GEMINI CALL ----
     const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
     const raw = await callGemini({ systemPrompt, userPrompt, model });
 
@@ -54,6 +53,8 @@ Constraints:
 
   } catch (err) {
     console.error("LLM error -> using fallback:", err?.message || err);
+    // Debug için geçici olarak şu satırı açıp ham hatayı döndürebilirsin:
+    // return res.status(502).json({ error: "gemini_failed", detail: String(err?.message || err) });
     return res.status(200).json({ questions: fallbackQuestions() });
   }
 }
@@ -99,11 +100,18 @@ async function callGemini({ systemPrompt, userPrompt, model }) {
   });
 
   if (!r.ok) {
-    const t = await r.text().catch(()=>"");
-    throw new Error(`Gemini failed ${r.status} ${t}`);
+    const t = await r.text().catch(() => "");
+    console.error("[Gemini HTTP ERROR]", r.status, t?.slice(0, 800));
+    throw new Error(`Gemini failed ${r.status}`);
   }
 
   const data = await r.json();
+
+  if (!data?.candidates?.length) {
+    console.error("[Gemini EMPTY CANDIDATES]", JSON.stringify(data?.promptFeedback || data, null, 2)?.slice(0, 1200));
+    throw new Error("gemini_empty_candidates");
+  }
+
   const txt =
     data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
     data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n")?.trim() ||
@@ -112,6 +120,7 @@ async function callGemini({ systemPrompt, userPrompt, model }) {
   try {
     return JSON.parse(stripCodeFences(txt));
   } catch {
+    console.error("[Gemini PARSE FAIL] raw:", txt?.slice(0, 800));
     throw new Error("gemini_parse_failed");
   }
 }
