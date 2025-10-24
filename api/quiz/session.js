@@ -1,8 +1,6 @@
 // api/quiz/session.js
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
     const body = await readJson(req);
@@ -10,11 +8,9 @@ export default async function handler(req, res) {
 
     const plan = buildDifficultyPlan(count);
 
-    // Şemayı net ve katı istiyoruz; sanitize buna göre çalışıyor.
     const systemPrompt = `
-You are a rigorous quiz generator. Output ONLY valid JSON object (no code fences, no prose).
-Follow EXACTLY this schema for the root object:
-
+You are a rigorous quiz generator. Output ONLY a valid JSON object (no code fences, no prose).
+Root schema:
 {
   "questions": [
     {
@@ -30,41 +26,34 @@ Follow EXACTLY this schema for the root object:
     }
   ]
 }
-
 Constraints:
-- Exactly 4 unique options and exactly one correct_index in [0..3].
+- Exactly 4 unique options and one correct_index in [0..3].
 - Difficulty distribution must follow the provided plan.
 - Language for stem, options, explanation MUST be "${lang}".
-- Keep explanations short (1 sentence).
-- Use safe/neutral content.
-- Do NOT include markdown or any text outside the JSON object.
+- Keep explanations one sentence. Safe/neutral content.
+- Do NOT include anything outside the JSON object.
 `.trim();
 
     const userPrompt = JSON.stringify({
       instruction: "Generate multiple-choice questions",
-      topics,                  // örn: ["world cuisine", "geography"]
-      difficulty_plan: plan,   // örn: ["easy","easy","medium","hard",...]
+      topics,
+      difficulty_plan: plan,
       count
     });
 
-    const provider = process.env.LLM_PROVIDER || "openai"; // "gemini" seçilirse Gemini çalışır
-    let raw;
+    // 🔒 Provider'ı sabitliyoruz ki yanlışlıkla OpenAI path'ine düşmesin
+    const provider = "gemini";
+    console.log("[/api/quiz/session] provider:", provider);
 
-    if (provider === "gemini") {
-      const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
-      raw = await callGemini({ systemPrompt, userPrompt, model });
-    } else {
-      // OpenAI/Groq/OpenRouter uyumlu yol
-      const model = process.env.LLM_MODEL || "gpt-4o-mini";
-      raw = await callOpenAICompat({ systemPrompt, userPrompt, model });
-    }
+    // ---- GEMINI CALL ----
+    const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+    const raw = await callGemini({ systemPrompt, userPrompt, model });
 
     const cleaned = sanitizeAndValidate(raw);
     return res.status(200).json({ questions: cleaned.questions });
 
   } catch (err) {
     console.error("LLM error -> using fallback:", err?.message || err);
-    // Üretim düşmesin; fallback döndür
     return res.status(200).json({ questions: fallbackQuestions() });
   }
 }
@@ -79,44 +68,11 @@ function buildDifficultyPlan(n) {
 }
 
 async function readJson(req) {
-  // Next.js pages/api bazen req.body parse eder; stream güvenli çözüm:
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
+  // Next.js bazı ortamlarda req.body hazır gelebilir
+  if (req.body && typeof req.body === "object") return req.body;
+  const chunks = []; for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString("utf8");
   return raw ? JSON.parse(raw) : {};
-}
-
-/* ---------- OpenAI uyumlu çağrı (OpenAI/Groq/OpenRouter) ---------- */
-async function callOpenAICompat({ systemPrompt, userPrompt, model }) {
-  const apiKey  = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY;
-  const baseUrl = process.env.LLM_BASE_URL || "https://api.openai.com/v1";
-  if (!apiKey) throw new Error("LLM_API_KEY missing");
-
-  const r = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: userPrompt }
-      ],
-      temperature: 0.7
-    })
-  });
-
-  if (!r.ok) {
-    const t = await r.text().catch(()=>"");
-    throw new Error(`LLM failed ${r.status} ${t}`);
-  }
-
-  const data = await r.json();
-  const content = data.choices?.[0]?.message?.content?.trim() || "{}";
-  try {
-    return JSON.parse(stripCodeFences(content));
-  } catch {
-    throw new Error("openai_parse_failed");
-  }
 }
 
 /* ---------- Gemini çağrısı ---------- */
@@ -127,21 +83,13 @@ async function callGemini({ systemPrompt, userPrompt, model }) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const payload = {
-    // Sistem yönergesini ayrı geçiyoruz (daha istikrarlı JSON)
-    systemInstruction: {
-      role: "system",
-      parts: [{ text: systemPrompt }]
-    },
-    contents: [
-      { role: "user", parts: [{ text: userPrompt }] }
-    ],
+    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
     generationConfig: {
       temperature: 0.7,
       maxOutputTokens: 2048,
-      // JSON zorlaması (v1beta destekli)
-      response_mime_type: "application/json"
+      response_mime_type: "application/json" // JSON’u zorla
     }
-    // safetySettings istersen eklenebilir
   };
 
   const r = await fetch(url, {
