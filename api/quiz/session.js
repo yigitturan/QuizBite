@@ -45,7 +45,7 @@ Constraints:
     const provider = "gemini";
     console.log("[/api/quiz/session] provider:", provider);
 
-    const model = process.env.GEMINI_MODEL || "gemini-flash-latest";
+    const model = process.env.GEMINI_MODEL || "gemini-1.5-flash-latest";
     const raw = await callGemini({ promptText, userPrompt, model });
 
     const cleaned = sanitizeAndValidate(raw);
