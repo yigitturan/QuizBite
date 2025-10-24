@@ -24,6 +24,13 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sqlite"
+    ],
+
+    "extra": {
+      "API_BASE": "https://senin-domainin.com" 
     }
   }
 }
