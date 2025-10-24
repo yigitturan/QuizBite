@@ -1,29 +1,75 @@
 // api/quiz/session.js
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
     const body = await readJson(req);
-    const { count = 10, lang = "en", topics = [], model = process.env.LLM_MODEL || "gpt-4o-mini" } = body;
+    const { count = 10, lang = "en", topics = [] } = body;
 
     const plan = buildDifficultyPlan(count);
-    const systemPrompt = `
-You are a rigorous quiz generator. Output ONLY JSON.
-4 unique options, one correct_index (0..3), short explanation, difficulty in "easy|medium|hard".
-Language: ${lang}. Safe/neutral content.
-`;
-    const userPrompt = JSON.stringify({ instruction: "Generate MCQs", topics, difficulty_plan: plan, count });
 
-    const json = await callLLM({ systemPrompt, userPrompt, model });
-    const cleaned = sanitizeAndValidate(json);
+    // Şemayı net ve katı istiyoruz; sanitize buna göre çalışıyor.
+    const systemPrompt = `
+You are a rigorous quiz generator. Output ONLY valid JSON object (no code fences, no prose).
+Follow EXACTLY this schema for the root object:
+
+{
+  "questions": [
+    {
+      "id": "string",
+      "stem": "string",
+      "options": ["string","string","string","string"],
+      "correct_index": 0,
+      "explanation": "string",
+      "difficulty": "easy|medium|hard",
+      "category": "string",
+      "tags": ["string", "..."],
+      "lang": "${lang}"
+    }
+  ]
+}
+
+Constraints:
+- Exactly 4 unique options and exactly one correct_index in [0..3].
+- Difficulty distribution must follow the provided plan.
+- Language for stem, options, explanation MUST be "${lang}".
+- Keep explanations short (1 sentence).
+- Use safe/neutral content.
+- Do NOT include markdown or any text outside the JSON object.
+`.trim();
+
+    const userPrompt = JSON.stringify({
+      instruction: "Generate multiple-choice questions",
+      topics,                  // örn: ["world cuisine", "geography"]
+      difficulty_plan: plan,   // örn: ["easy","easy","medium","hard",...]
+      count
+    });
+
+    const provider = process.env.LLM_PROVIDER || "openai"; // "gemini" seçilirse Gemini çalışır
+    let raw;
+
+    if (provider === "gemini") {
+      const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+      raw = await callGemini({ systemPrompt, userPrompt, model });
+    } else {
+      // OpenAI/Groq/OpenRouter uyumlu yol
+      const model = process.env.LLM_MODEL || "gpt-4o-mini";
+      raw = await callOpenAICompat({ systemPrompt, userPrompt, model });
+    }
+
+    const cleaned = sanitizeAndValidate(raw);
     return res.status(200).json({ questions: cleaned.questions });
+
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "quiz_generation_failed", detail: String(err?.message || err) });
+    console.error("LLM error -> using fallback:", err?.message || err);
+    // Üretim düşmesin; fallback döndür
+    return res.status(200).json({ questions: fallbackQuestions() });
   }
 }
 
-/* helpers */
+/* ---------- Helpers ---------- */
 function buildDifficultyPlan(n) {
   if (n <= 3) return Array(n).fill("easy");
   const e = Math.max(1, Math.floor(n * 0.3));
@@ -31,12 +77,18 @@ function buildDifficultyPlan(n) {
   const h = Math.max(1, n - e - m);
   return [...Array(e).fill("easy"), ...Array(m).fill("medium"), ...Array(h).fill("hard")];
 }
+
 async function readJson(req) {
-  const chunks = []; for await (const c of req) chunks.push(c);
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  // Next.js pages/api bazen req.body parse eder; stream güvenli çözüm:
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const raw = Buffer.concat(chunks).toString("utf8");
+  return raw ? JSON.parse(raw) : {};
 }
-async function callLLM({ systemPrompt, userPrompt, model }) {
-  const apiKey = process.env.LLM_API_KEY;
+
+/* ---------- OpenAI uyumlu çağrı (OpenAI/Groq/OpenRouter) ---------- */
+async function callOpenAICompat({ systemPrompt, userPrompt, model }) {
+  const apiKey  = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY;
   const baseUrl = process.env.LLM_BASE_URL || "https://api.openai.com/v1";
   if (!apiKey) throw new Error("LLM_API_KEY missing");
 
@@ -45,31 +97,95 @@ async function callLLM({ systemPrompt, userPrompt, model }) {
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
-      messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userPrompt }
+      ],
       temperature: 0.7
     })
   });
-  if (!r.ok) throw new Error(`LLM failed ${r.status} ${await r.text().catch(()=> "")}`);
+
+  if (!r.ok) {
+    const t = await r.text().catch(()=>"");
+    throw new Error(`LLM failed ${r.status} ${t}`);
+  }
 
   const data = await r.json();
   const content = data.choices?.[0]?.message?.content?.trim() || "{}";
-  try { return JSON.parse(content); }
-  catch { return JSON.parse(content.replace(/```json|```/g, "").trim()); }
+  try {
+    return JSON.parse(stripCodeFences(content));
+  } catch {
+    throw new Error("openai_parse_failed");
+  }
 }
+
+/* ---------- Gemini çağrısı ---------- */
+async function callGemini({ systemPrompt, userPrompt, model }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY missing");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const payload = {
+    // Sistem yönergesini ayrı geçiyoruz (daha istikrarlı JSON)
+    systemInstruction: {
+      role: "system",
+      parts: [{ text: systemPrompt }]
+    },
+    contents: [
+      { role: "user", parts: [{ text: userPrompt }] }
+    ],
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 2048,
+      // JSON zorlaması (v1beta destekli)
+      response_mime_type: "application/json"
+    }
+    // safetySettings istersen eklenebilir
+  };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!r.ok) {
+    const t = await r.text().catch(()=>"");
+    throw new Error(`Gemini failed ${r.status} ${t}`);
+  }
+
+  const data = await r.json();
+  const txt =
+    data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+    data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n")?.trim() ||
+    "{}";
+
+  try {
+    return JSON.parse(stripCodeFences(txt));
+  } catch {
+    throw new Error("gemini_parse_failed");
+  }
+}
+
+/* ---------- JSON temizleme/doğrulama ---------- */
 function sanitizeAndValidate(payload) {
   const out = { questions: [] };
   const arr = payload?.questions || [];
   for (const q of arr) {
     if (!q) continue;
-    const opts = Array.isArray(q.options) ? q.options.slice(0,4) : [];
+
+    const opts = Array.isArray(q.options) ? q.options.slice(0, 4) : [];
     const idx = Number(q.correct_index);
+
     if (opts.length !== 4) continue;
-    if (new Set(opts.map(s => (s ?? "").trim())).size !== 4) continue;
+    if (new Set(opts.map(s => (s ?? "").toString().trim())).size !== 4) continue;
     if (!(idx >= 0 && idx <= 3)) continue;
+
     out.questions.push({
       id: String(q.id || Math.random().toString(36).slice(2)),
-      stem: String(q.stem || "").trim(),
-      options: opts,
+      stem: String(q.stem || q.q || q.question || "").trim(),
+      options: opts.map(String),
       correct_index: idx,
       explanation: String(q.explanation || "").trim(),
       difficulty: ["easy","medium","hard"].includes(q.difficulty) ? q.difficulty : "medium",
@@ -80,4 +196,24 @@ function sanitizeAndValidate(payload) {
   }
   if (!out.questions.length) throw new Error("no_valid_questions");
   return out;
+}
+
+function stripCodeFences(s = "") {
+  return s.replace(/^\s*```json\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+}
+
+/* ---------- LLM down ise fallback ---------- */
+function fallbackQuestions() {
+  return [
+    { id:"f1", stem:"Which planet is known as the Red Planet?", options:["Mercury","Mars","Jupiter","Venus"], correct_index:1, explanation:"Iron oxide gives Mars its color.", difficulty:"easy" },
+    { id:"f2", stem:"What is the capital of Japan?", options:["Seoul","Tokyo","Beijing","Osaka"], correct_index:1, difficulty:"easy" },
+    { id:"f3", stem:"H2O is the chemical formula for what?", options:["Oxygen","Hydrogen","Salt","Water"], correct_index:3, difficulty:"easy" },
+    { id:"f4", stem:"What is 9 × 7?", options:["56","72","63","81"], correct_index:2, difficulty:"easy" },
+    { id:"f5", stem:"Which ocean is largest by area?", options:["Indian","Pacific","Atlantic","Arctic"], correct_index:1, difficulty:"medium" },
+    { id:"f6", stem:"Who wrote '1984'?", options:["George Orwell","J.K. Rowling","Ernest Hemingway","F. Scott Fitzgerald"], correct_index:0, difficulty:"medium" },
+    { id:"f7", stem:"Smallest prime number?", options:["0","1","2","3"], correct_index:2, difficulty:"medium" },
+    { id:"f8", stem:"Which gas do plants absorb?", options:["Oxygen","Nitrogen","Carbon Dioxide","Helium"], correct_index:2, difficulty:"medium" },
+    { id:"f9", stem:"Which language in Brazil?", options:["Spanish","Portuguese","French","English"], correct_index:1, difficulty:"hard" },
+    { id:"f10", stem:"Instrument with keys, pedals, strings?", options:["Guitar","Piano","Violin","Flute"], correct_index:1, difficulty:"hard" },
+  ];
 }

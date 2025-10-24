@@ -29,8 +29,6 @@
       "expo-sqlite"
     ],
 
-    "extra": {
-      "API_BASE": "https://senin-domainin.com" 
-    }
+    "extra": { "API_BASE": "https://quiz-bite.vercel.app" }
   }
 }

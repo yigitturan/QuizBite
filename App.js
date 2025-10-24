@@ -10,6 +10,7 @@ import {
   Easing,
   Dimensions,
   ImageBackground,
+  ActivityIndicator
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -19,6 +20,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import Svg, { G, Path, Circle } from "react-native-svg";
 import RestaurantPickerModal from "./components/RestaurantPickerModal";
 import { getSelectedRestaurant, setSelectedRestaurant } from "./store/selection";
+import { fetchQuizSession } from "./services/quizApi"; // <-- LLM backend çağrısı
 
 
 const Stack = createNativeStackNavigator();
@@ -300,41 +302,148 @@ const QUESTIONS = [
 /* =========================================================
    Page3 — Quiz + Interstitial + Flash + Emoji burst
 ========================================================= */
-import { ActivityIndicator } from "react-native";
-import { fetchQuizSession } from "./services/quizApi";
-import { getSelectedRestaurant } from "./store/selection";
-
 function Page3({ navigation, route }) {
-  // Seçili restoran (Page2'den param veya store)
   const chosen = route?.params?.restaurant ?? getSelectedRestaurant();
 
-  // --------- LLM'den gelen sorular ---------
-  const [questions, setQuestions] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [loadErr, setLoadErr] = useState(null);
-
-  // --------- Quiz durumu ---------
+  // ---- Sabitler
   const START_SECONDS = 35;
   const EMOJI_SLOWMO = 1.6;
 
+  // ---- LLM veya fallback'ten gelecek soru listesi
+  const [questions, setQuestions] = useState([]); // {id,q,options[],correctIndex,explanation?,difficulty?,...}
+  const TOTAL = questions.length;
+
+  // ---- UI durumları
+  const [loading, setLoading] = useState(true);
   const [qIndex, setQIndex] = useState(0);
   const [mode, setMode] = useState("question"); // "question" | "success" | "fail"
+  const [status, setStatus] = useState([]);     // her soru için "idle|current|correct|wrong"
+
+  // ---- Timer
   const [seconds, setSeconds] = useState(START_SECONDS);
-
-  const [status, setStatus] = useState([]); // her soru için: idle|current|correct|wrong
-
-  // --------- Zamanlayıcı animasyonu ---------
   const timerAnim = useRef(new Animated.Value(1)).current;
 
-  // --------- Emoji patlaması + flash overlay ---------
+  // ---- Emoji/görsel efektler
   const { width, height } = Dimensions.get("window");
   const successEmojis = ["👏","🎉","✨","🏆","🎊"];
   const failEmojis    = ["❌","😞","💥","⚠️","🚫"];
-
   const flashOpacity = useRef(new Animated.Value(0)).current;
   const flashColorValue = useRef(new Animated.Value(0)).current; // 0=success, 1=fail
   const [particles, setParticles] = useState([]);
 
+  // ---- FALLBACK: offline/LLM hatası için örnek sorular
+  const FALLBACK_QUESTIONS = useMemo(() => ([
+    {
+      id: "f1",
+      q: "Which planet is known as the Red Planet?",
+      options: ["Mercury", "Mars", "Jupiter", "Venus"],
+      correctIndex: 1,
+      explanation: "Mars appears reddish due to iron oxide.",
+      difficulty: "easy",
+    },
+    {
+      id: "f2",
+      q: "What is the capital of Japan?",
+      options: ["Seoul", "Tokyo", "Beijing", "Osaka"],
+      correctIndex: 1,
+      difficulty: "easy",
+    },
+    // ... en az 8 tane daha doldur
+  ]), []);
+
+  // ---- LLM den soru çek + map et + fallback
+  useEffect(() => {
+    (async () => {
+      try {
+        setLoading(true);
+        // restoran adına göre topics (isteğe bağlı)
+        const topics = chosen?.name ? inferTopicsFromRestaurant(chosen.name) : [];
+
+        const raw = await fetchQuizSession({
+          count: 10,
+          lang: "en",
+          topics,
+        });
+        // LLM çıktısını UI formatına map et
+        const mapped = (raw || []).map((q) => ({
+          id: String(q.id || Math.random().toString(36).slice(2)),
+          q: String(q.stem || q.q || "").trim(),
+          options: Array.isArray(q.options) ? q.options.slice(0,4) : [],
+          correctIndex: typeof q.correct_index === "number" ? q.correct_index
+                        : typeof q.correctIndex === "number" ? q.correctIndex
+                        : 0,
+          explanation: q.explanation ? String(q.explanation) : "",
+          difficulty: q.difficulty || "medium",
+        }))
+        .filter(item =>
+          item.q &&
+          item.options.length === 4 &&
+          item.correctIndex >= 0 &&
+          item.correctIndex < 4
+        );
+
+        const finalQs = mapped.length ? orderByDifficulty(mapped) : orderByDifficulty(FALLBACK_QUESTIONS);
+        setQuestions(finalQs);
+        setStatus(Array(finalQs.length).fill("idle").map((s, i) => (i === 0 ? "current" : "idle")));
+        setQIndex(0);
+        setMode("question");
+        resetTimer();
+      } catch (e) {
+        console.warn("LLM failed, using fallback:", e?.message || e);
+        const finalQs = orderByDifficulty(FALLBACK_QUESTIONS);
+        setQuestions(finalQs);
+        setStatus(Array(finalQs.length).fill("idle").map((s, i) => (i === 0 ? "current" : "idle")));
+        setQIndex(0);
+        setMode("question");
+        resetTimer();
+      } finally {
+        setLoading(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- Timer reset helper
+  const resetTimer = () => {
+    setSeconds(START_SECONDS);
+    timerAnim.stopAnimation();
+    timerAnim.setValue(1);
+    Animated.timing(timerAnim, {
+      toValue: 0,
+      duration: START_SECONDS * 1000,
+      easing: Easing.linear,
+      useNativeDriver: false,
+    }).start();
+  };
+
+  // ---- Soru moduna geçince geri sayım başlat
+  useEffect(() => {
+    if (mode !== "question") return;
+    let ok = true;
+    const id = setInterval(() => {
+      if (!ok) return;
+      setSeconds((s) => {
+        if (s <= 1) clearInterval(id);
+        return s - 1;
+      });
+    }, 1000);
+    return () => { ok = false; clearInterval(id); };
+  }, [qIndex, mode]);
+
+  // ---- Süre biterse
+  useEffect(() => {
+    if (mode === "question" && seconds === 0) {
+      setStatus((prev) => {
+        const c = [...prev];
+        c[qIndex] = "wrong";
+        return c;
+      });
+      setMode("fail");
+      burstEmojis("fail");
+    }
+  }, [seconds, mode, qIndex]);
+
+  // ---- Emoji patlaması
   const burstEmojis = (type = "success", N = 48) => {
     const list = type === "success" ? successEmojis : failEmojis;
     const created = Array.from({ length: N }).map((_, i) => {
@@ -368,115 +477,66 @@ function Page3({ navigation, route }) {
     ]).start(() => setParticles([]));
   };
 
-  // --------- Soruları getir (LLM → serverless) ---------
-  useEffect(() => {
-    (async () => {
-      try {
-        setLoading(true);
-        setLoadErr(null);
-
-        // İstersen restorana göre topic üret
-        const topics = chosen ? inferTopicsFromRestaurant(chosen.name) : [];
-
-        const qs = await fetchQuizSession({
-          count: 10,
-          lang: "en",     // cihaz diline göre dinamik yapabilirsin
-          topics,         // örn: ["food","mediterranean"] gibi
-        });
-
-        // Güvenlik: temel doğrulama
-        const valid = Array.isArray(qs) ? qs.filter(isValidQuestion) : [];
-        if (valid.length === 0) throw new Error("No valid questions returned.");
-
-        // Kolay→Orta→Zor sırayı koru (endpoint planlıyor, ama garanti)
-        const ordered = orderByDifficulty(valid);
-
-        setQuestions(ordered);
-        setStatus(Array(ordered.length).fill("idle").map((_, i) => (i === 0 ? "current" : "idle")));
-        setQIndex(0);
-        setMode("question");
-        setSeconds(START_SECONDS);
-        timerAnim.setValue(1);
-      } catch (e) {
-        console.error(e);
-        setLoadErr(String(e.message || e));
-      } finally {
-        setLoading(false);
-      }
-    })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // --------- Soru değişince timer başlat ---------
-  useEffect(() => {
-    if (loading || loadErr || !questions.length) return;
-    if (mode !== "question") return;
-
-    setSeconds(START_SECONDS);
-    timerAnim.stopAnimation();
-    timerAnim.setValue(1);
-
-    const dur = START_SECONDS * 1000;
-    Animated.timing(timerAnim, { toValue: 0, duration: dur, easing: Easing.linear, useNativeDriver: false }).start();
-
-    let ok = true;
-    const id = setInterval(() => {
-      if (!ok) return;
-      setSeconds((s) => {
-        if (s <= 1) clearInterval(id);
-        return s - 1;
-      });
-    }, 1000);
-
-    return () => { ok = false; clearInterval(id); };
-  }, [qIndex, mode, loading, loadErr, questions.length, timerAnim]);
-
-  // --------- Süre biterse yanlış ---------
-  useEffect(() => {
-    if (mode === "question" && seconds === 0) {
-      setStatus((prev) => { const c = [...prev]; c[qIndex] = "wrong"; return c; });
-      setMode("fail");
-      burstEmojis("fail");
-    }
-  }, [seconds, mode, qIndex]);
-
-  // --------- Yardımcılar ---------
-  const TOTAL = questions.length;
-  const currentQ = questions[qIndex];
-  const timerWidth = timerAnim.interpolate({ inputRange: [0,1], outputRange: ["0%","100%"] });
-
+  // ---- Yardımcılar
+  const orderByDifficulty = (arr) => {
+    // easy → medium → hard sıralı gelsin (aynı ise mevcut sırayı koru)
+    const rank = { easy: 0, medium: 1, hard: 2 };
+    return [...arr].sort((a, b) => (rank[a.difficulty] ?? 1) - (rank[b.difficulty] ?? 1));
+  };
+  const inferTopicsFromRestaurant = (name) => {
+    const n = (name || "").toLowerCase();
+    if (n.includes("kebab") || n.includes("doner")) return ["food", "turkish cuisine"];
+    if (n.includes("zeytin") || n.includes("olive")) return ["mediterranean", "food"];
+    return ["general"];
+  };
   const colorForStep = (s) =>
     s === "current" ? PALETTE.progressCurrent :
     s === "correct" ? PALETTE.progressCorrect :
     s === "wrong"   ? PALETTE.progressWrong :
                       PALETTE.progressDefault;
 
+  // ---- Cevap seçimi
   const onAnswer = (i) => {
     if (mode !== "question") return;
-    const ok = i === currentQ.correct_index;
-    setStatus((prev) => { const c = [...prev]; c[qIndex] = ok ? "correct" : "wrong"; return c; });
+    const currentQ = questions[qIndex];
+    const ok = i === currentQ.correctIndex;
+    setStatus((prev) => {
+      const c = [...prev];
+      c[qIndex] = ok ? "correct" : "wrong";
+      return c;
+    });
     setMode(ok ? "success" : "fail");
     burstEmojis(ok ? "success" : "fail");
   };
 
+  // ---- Sonraki soruya geç
   const goNext = () => {
     if (qIndex + 1 >= TOTAL) {
       navigation.navigate("Page4");
       return;
     }
-    setStatus((prev) => { const c = [...prev]; c[qIndex + 1] = "current"; return c; });
     setQIndex((n) => n + 1);
     setMode("question");
+    setStatus((prev) => {
+      const c = [...prev];
+      c[qIndex + 1] = "current";
+      return c;
+    });
+    resetTimer();
   };
 
-  // --------- Loading / Error Ekranları ---------
+  // ---- Timer genişliği
+  const timerWidth = timerAnim.interpolate({ inputRange: [0, 1], outputRange: ["0%", "100%"] });
+
+  // ---- Render
   if (loading) {
     return (
       <LinearGradient colors={[PALETTE.gradStart, PALETTE.gradEnd]} style={{ flex: 1 }}>
         <StatusBar style="light" translucent backgroundColor="transparent" />
-        <SafeAreaView style={[styles.fullscreenCenter, { paddingHorizontal: 20 }]}>
-          <ActivityIndicator size="large" color="#fff" />
-          <Text style={{ color: PALETTE.subtext, marginTop: 10, fontWeight: "800" }}>
+        <SafeAreaView edges={["top","right","bottom","left"]}
+          style={{ flex:1, alignItems:"center", justifyContent:"center", gap:12 }}>
+          <ActivityIndicator size="large" />
+          <Text style={{ color: PALETTE.subtext, fontWeight:"800" }}>
             Generating questions…
           </Text>
         </SafeAreaView>
@@ -484,31 +544,32 @@ function Page3({ navigation, route }) {
     );
   }
 
-  if (loadErr || !TOTAL) {
+  // güvenlik: hiç soru yoksa fallback
+  if (!TOTAL) {
     return (
       <LinearGradient colors={[PALETTE.gradStart, PALETTE.gradEnd]} style={{ flex: 1 }}>
         <StatusBar style="light" translucent backgroundColor="transparent" />
-        <SafeAreaView style={[styles.fullscreenCenter, { paddingHorizontal: 20 }]}>
-          <Text style={{ color: "#fff", fontWeight: "900", fontSize: 18, textAlign: "center" }}>
-            Failed to load quiz.
+        <SafeAreaView edges={["top","right","bottom","left"]}
+          style={{ flex:1, alignItems:"center", justifyContent:"center", gap:12 }}>
+          <Text style={{ color: PALETTE.text, fontWeight:"900", fontSize:18 }}>
+            No questions available.
           </Text>
-          <Text style={{ color: PALETTE.subtext, textAlign: "center", marginTop: 6 }}>
-            {loadErr || "Please try again."}
-          </Text>
-          <Pressable onPress={() => navigation.goBack()} style={[styles.ghostBtn, { marginTop: 12 }]}>
-            <Text style={[styles.ghostText, { color: "#fff", fontSize: 16 }]}>Back</Text>
+          <Pressable onPress={() => navigation.goBack()}
+            style={({pressed})=>[{ padding:12, borderRadius:12, borderWidth:1, borderColor:"rgba(255,255,255,0.18)",
+              backgroundColor: pressed ? "rgba(255,255,255,0.06)" : "transparent"}]}>
+            <Text style={{ color: PALETTE.text, fontWeight:"800" }}>Back</Text>
           </Pressable>
         </SafeAreaView>
       </LinearGradient>
     );
   }
 
-  // --------- Normal Quiz UI ---------
+  const currentQ = questions[qIndex];
+
   return (
     <LinearGradient colors={[PALETTE.gradStart, PALETTE.gradEnd]} style={{ flex: 1 }}>
       <StatusBar style="light" translucent backgroundColor="transparent" />
       <SafeAreaView edges={["top","right","bottom","left"]} style={styles.quizContainer}>
-
         {/* progress bar */}
         <View style={styles.progressRow}>
           {status.map((s, i) => (
@@ -519,17 +580,7 @@ function Page3({ navigation, route }) {
         {mode === "question" && (
           <>
             <View style={styles.questionWrap}>
-              <Text style={[styles.questionText, { color: PALETTE.text }]}>{currentQ.stem}</Text>
-              {chosen && (
-                <Text style={{ color: PALETTE.subtext, fontWeight: "800", textAlign: "center", marginTop: 6 }}>
-                  For: {chosen.name}
-                </Text>
-              )}
-              {currentQ.difficulty && (
-                <Text style={{ color: PALETTE.subtext, fontWeight: "700", marginTop: 6 }}>
-                  Difficulty: {currentQ.difficulty}
-                </Text>
-              )}
+              <Text style={[styles.questionText, { color: PALETTE.text }]}>{currentQ.q}</Text>
             </View>
 
             <View style={styles.optionsWrap}>
@@ -556,12 +607,8 @@ function Page3({ navigation, route }) {
 
         {mode === "success" && (
           <View style={styles.interludeWrap}>
-            <Text style={[styles.interludeTitle, { color: PALETTE.text }]}>🎉 Correct!</Text>
-            {!!currentQ.explanation && (
-              <Text style={[styles.interludeSub, { color: PALETTE.subtext }]}>
-                {currentQ.explanation}
-              </Text>
-            )}
+            <Text style={[styles.interludeTitle, { color: PALETTE.text }]}>🎉 Congrats, correct!</Text>
+            <Text style={[styles.interludeSub,   { color: PALETTE.subtext }]}>Next question</Text>
             <Pressable onPress={goNext} style={({ pressed }) => [styles.nextBtn, { backgroundColor: pressed ? PALETTE.primaryBluePressed : PALETTE.primaryBlue }]}>
               <Text style={styles.nextText}>NEXT</Text>
             </Pressable>
@@ -570,12 +617,8 @@ function Page3({ navigation, route }) {
 
         {mode === "fail" && (
           <View style={styles.interludeWrap}>
-            <Text style={[styles.interludeTitle, { color: PALETTE.text }]}>❌ Wrong</Text>
-            {!!currentQ.explanation && (
-              <Text style={[styles.interludeSub, { color: PALETTE.subtext }]}>
-                {currentQ.explanation}
-              </Text>
-            )}
+            <Text style={[styles.interludeTitle, { color: PALETTE.text }]}>❌ Sorry, wrong.</Text>
+            <Text style={[styles.interludeSub,   { color: PALETTE.subtext }]}>See you next time!</Text>
             <Pressable
               onPress={() => navigation.reset({ index: 0, routes: [{ name: "Page1" }] })}
               style={({ pressed }) => [styles.nextBtn, { backgroundColor: pressed ? "#e04b4b" : "#f05c5c" }]}
@@ -616,34 +659,16 @@ function Page3({ navigation, route }) {
             </Animated.Text>
           ))}
         </View>
+
+        {chosen && (
+          <Text style={{ color: PALETTE.subtext, fontWeight: "800", textAlign: "center", marginTop: 6 }}>
+            For: {chosen.name}
+          </Text>
+        )}
       </SafeAreaView>
     </LinearGradient>
   );
 }
-
-/* ----- küçük yardımcılar ----- */
-
-function isValidQuestion(q) {
-  if (!q) return false;
-  if (!q.stem || !Array.isArray(q.options) || q.options.length !== 4) return false;
-  const idx = Number(q.correct_index);
-  if (!(idx >= 0 && idx <= 3)) return false;
-  const uniq = new Set(q.options.map((s) => (s ?? "").trim()));
-  return uniq.size === 4;
-}
-
-function orderByDifficulty(arr) {
-  const level = (d) => (d === "easy" ? 1 : d === "medium" ? 2 : d === "hard" ? 3 : 2);
-  return [...arr].sort((a, b) => level(a.difficulty) - level(b.difficulty));
-}
-
-function inferTopicsFromRestaurant(name = "") {
-  const n = name.toLowerCase();
-  if (n.includes("zeytin")) return ["food", "mediterranean", "culture"];
-  if (n.includes("sushi"))  return ["food", "japan"];
-  return [];
-}
-
 
 /* =========================================================
    Page4 — Rewards summary (Wheel button = custom image)
