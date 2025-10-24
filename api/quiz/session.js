@@ -1,7 +1,19 @@
 // api/quiz/session.js
+// Runtime: Vercel Serverless (Node)
+// Not: package.json'da "type":"module" yok => CommonJS export kullanıyoruz.
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+module.exports = async function (req, res) {
+  // CORS (web'ten çağıracaksan gerekir; Expo native için şart değil)
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    return res.status(200).end();
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
     const body = await readJson(req);
@@ -42,48 +54,49 @@ Constraints:
       count
     });
 
-    const provider = "gemini";
-    console.log("[/api/quiz/session] provider:", provider);
-
-    const model = process.env.GEMINI_MODEL || "gemini-1.5-flash-latest";
-    const raw = await callGemini({ promptText, userPrompt, model });
+    // === Seçenek B: Gemini 2.0 (v1beta) ===
+    const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+    const raw = await callGeminiV1Beta({ promptText, userPrompt, model });
 
     const cleaned = sanitizeAndValidate(raw);
+    res.setHeader("Access-Control-Allow-Origin", "*");
     return res.status(200).json({ questions: cleaned.questions });
 
   } catch (err) {
     console.error("LLM error -> using fallback:", err?.message || err);
+    res.setHeader("Access-Control-Allow-Origin", "*");
     return res.status(200).json({ questions: fallbackQuestions() });
   }
-}
+};
 
-/* ---------- Gemini çağrısı ---------- */
-async function callGemini({ promptText, userPrompt, model }) {
+/* ---------- Gemini v1beta çağrısı (2.0 serisi) ---------- */
+async function callGeminiV1Beta({ promptText, userPrompt, model }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY missing");
 
-  const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
+  // v1beta endpoint + X-goog-api-key header
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
   const payload = {
     contents: [
       {
         role: "user",
-        parts: [
-          { text: promptText },
-          { text: userPrompt }
-        ]
-      }
+        parts: [{ text: promptText }, { text: userPrompt }],
+      },
     ],
     generationConfig: {
       temperature: 0.7,
-      maxOutputTokens: 2048
-    }
+      maxOutputTokens: 2048,
+    },
   };
 
   const r = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    headers: {
+      "Content-Type": "application/json",
+      "X-goog-api-key": apiKey,
+    },
+    body: JSON.stringify(payload),
   });
 
   if (!r.ok) {
@@ -93,9 +106,12 @@ async function callGemini({ promptText, userPrompt, model }) {
   }
 
   const data = await r.json();
+
+  // v1beta response tipik olarak: data.candidates[0].content.parts[*].text
+  const parts = data?.candidates?.[0]?.content?.parts || [];
   const txt =
-    data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
-    data.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n")?.trim() ||
+    parts.find((p) => typeof p.text === "string")?.text?.trim() ||
+    parts.map((p) => p.text).filter(Boolean).join("\n")?.trim() ||
     "{}";
 
   try {
@@ -106,7 +122,7 @@ async function callGemini({ promptText, userPrompt, model }) {
   }
 }
 
-/* ---------- Helpers (değişmedi) ---------- */
+/* ---------- Helpers ---------- */
 function buildDifficultyPlan(n) {
   if (n <= 3) return Array(n).fill("easy");
   const e = Math.max(1, Math.floor(n * 0.3));
@@ -116,10 +132,10 @@ function buildDifficultyPlan(n) {
 }
 
 async function readJson(req) {
-  if (req.body && typeof req.body === "object") return req.body;
+  // Vercel Node function: req bir stream
   const chunks = []; for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : {};
+  try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
 }
 
 function sanitizeAndValidate(payload) {
