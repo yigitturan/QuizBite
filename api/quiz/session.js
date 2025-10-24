@@ -41,7 +41,7 @@ Constraints:
       count
     });
 
-    // 🔒 Sadece Gemini
+    // 🔒 Gemini only
     const provider = "gemini";
     console.log("[/api/quiz/session] provider:", provider);
 
@@ -52,9 +52,8 @@ Constraints:
     return res.status(200).json({ questions: cleaned.questions });
 
   } catch (err) {
+    // Hata olsa bile uygulama düşmesin: her zaman 200 + fallback
     console.error("LLM error -> using fallback:", err?.message || err);
-    // Debug için geçici olarak şu satırı açıp ham hatayı döndürebilirsin:
-    // return res.status(502).json({ error: "gemini_failed", detail: String(err?.message || err) });
     return res.status(200).json({ questions: fallbackQuestions() });
   }
 }
@@ -69,66 +68,110 @@ function buildDifficultyPlan(n) {
 }
 
 async function readJson(req) {
-  // Next.js bazı ortamlarda req.body hazır gelebilir
   if (req.body && typeof req.body === "object") return req.body;
   const chunks = []; for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString("utf8");
   return raw ? JSON.parse(raw) : {};
 }
 
-/* ---------- Gemini çağrısı ---------- */
-/* ---------- Gemini çağrısı (v1 + snake_case) ---------- */
+/* ---------- Gemini çağrısı: v1 (snake_case) -> (gerekirse) v1beta (camelCase) otomatik fallback ---------- */
 async function callGemini({ systemPrompt, userPrompt, model }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY missing");
 
-  // v1 endpoint
-  const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
-
-  // v1'de alan adları snake_case olmalı.
-  // Ayrıca generation_config içinde response_mime_type yok -> kaldırdık.
-  const payload = {
+  // v1 payload (snake_case)
+  const payloadV1 = {
     system_instruction: { role: "system", parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts: [{ text: userPrompt }] }],
     generation_config: {
       temperature: 0.7,
-      max_output_tokens: 2048
-    }
-    // safety_settings eklemek istersen burada snake_case ile tanımlanır
+      max_output_tokens: 2048,
+    },
   };
 
+  // v1beta payload (camelCase) + JSON ipucu
+  const payloadV1beta = {
+    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 2048,
+      // responseMimeType v1beta'da destekleniyor; JSON üretimi daha stabil olur
+      responseMimeType: "application/json",
+    },
+  };
+
+  // Önce v1 dener, 404/400 alan adı hatası gibi durumlarda v1beta dener.
+  // Diğer status'larda v1 hatasını döndürür (204 vs. değilse).
+  const tried = [];
+
+  // --- Try v1 ---
+  try {
+    const data = await geminiFetch({ apiKey, model, version: "v1", payload: payloadV1 });
+    return parseGeminiJson(data);
+  } catch (e) {
+    tried.push(`v1:${String(e?.message || e)}`);
+    const msg = String(e?.message || e);
+    // v1 alan adı hatası (400 JSON field) veya model not found (404) olursa v1beta deneyelim
+    if (!/v1beta|quota|rate|429|permission|403/i.test(msg)) {
+      // devam edip v1beta deneriz
+    } else {
+      // quota/permission gibi durumlarda tekrar denemenin anlamı yok
+      throw new Error(tried.join(" | "));
+    }
+  }
+
+  // --- Try v1beta ---
+  try {
+    const data = await geminiFetch({ apiKey, model, version: "v1beta", payload: payloadV1beta });
+    return parseGeminiJson(data);
+  } catch (e) {
+    tried.push(`v1beta:${String(e?.message || e)}`);
+    throw new Error(tried.join(" | "));
+  }
+}
+
+async function geminiFetch({ apiKey, model, version, payload }) {
+  const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${apiKey}`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
 
   if (!r.ok) {
     const t = await r.text().catch(() => "");
-    console.error("[Gemini HTTP ERROR]", r.status, t?.slice(0, 800));
-    throw new Error(`Gemini failed ${r.status}`);
+    console.error(`[Gemini HTTP ERROR] ${version} ${r.status} ${t?.slice(0, 800)}`);
+    throw new Error(`${version} ${r.status}`);
   }
+  return r.json();
+}
 
-  const data = await r.json();
-
+function parseGeminiJson(data) {
   if (!data?.candidates?.length) {
     console.error("[Gemini EMPTY CANDIDATES]", JSON.stringify(data?.promptFeedback || data, null, 2)?.slice(0, 1200));
     throw new Error("gemini_empty_candidates");
   }
-
   const txt =
-    data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
-    data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n")?.trim() ||
+    data.candidates[0]?.content?.parts?.[0]?.text?.trim() ||
+    data.candidates[0]?.content?.parts?.map(p => p.text).join("\n")?.trim() ||
     "{}";
 
-  try {
-    return JSON.parse(stripCodeFences(txt));
-  } catch {
+  // En sağlam parse: önce düz dene, sonra code fence temizle, en sonda gömülü JSON'u ayıkla
+  try { return JSON.parse(txt); } catch {}
+  try { return JSON.parse(stripCodeFences(txt)); } catch {}
+  try { return JSON.parse(extractJson(txt)); } catch {
     console.error("[Gemini PARSE FAIL] raw:", txt?.slice(0, 800));
     throw new Error("gemini_parse_failed");
   }
 }
 
+function extractJson(s = "") {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) throw new Error("no_json_braces");
+  return s.slice(start, end + 1);
+}
 
 /* ---------- JSON temizleme/doğrulama ---------- */
 function sanitizeAndValidate(payload) {
@@ -152,8 +195,8 @@ function sanitizeAndValidate(payload) {
       explanation: String(q.explanation || "").trim(),
       difficulty: ["easy","medium","hard"].includes(q.difficulty) ? q.difficulty : "medium",
       category: String(q.category || "general"),
-      tags: Array.isArray(q.tags) ? q.tags.slice(0,8).map(String) : [],
-      lang: String(q.lang || "en")
+      tags: Array.isArray(q.tags) ? q.tags.slice(0, 8).map(String) : [],
+      lang: String(q.lang || "en"),
     });
   }
   if (!out.questions.length) throw new Error("no_valid_questions");
