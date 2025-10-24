@@ -77,21 +77,24 @@ async function readJson(req) {
 }
 
 /* ---------- Gemini çağrısı ---------- */
+/* ---------- Gemini çağrısı (v1 + snake_case) ---------- */
 async function callGemini({ systemPrompt, userPrompt, model }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY missing");
 
+  // v1 endpoint
   const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
 
-
+  // v1'de alan adları snake_case olmalı.
+  // Ayrıca generation_config içinde response_mime_type yok -> kaldırdık.
   const payload = {
-    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+    system_instruction: { role: "system", parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-    generationConfig: {
+    generation_config: {
       temperature: 0.7,
-      maxOutputTokens: 2048,
-      response_mime_type: "application/json" // JSON’u zorla
+      max_output_tokens: 2048
     }
+    // safety_settings eklemek istersen burada snake_case ile tanımlanır
   };
 
   const r = await fetch(url, {
@@ -125,6 +128,7 @@ async function callGemini({ systemPrompt, userPrompt, model }) {
     throw new Error("gemini_parse_failed");
   }
 }
+
 
 /* ---------- JSON temizleme/doğrulama ---------- */
 function sanitizeAndValidate(payload) {
